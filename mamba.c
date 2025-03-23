@@ -532,11 +532,71 @@ void forward_layer(Mamba* mamba, unsigned long long l, float* hidden_state) {
     matmul(hidden_state, y, w->out_proj + l*dim*d_inner, dim, d_inner);
 }
 
+// init mamba in python
+void forward_bi_bi_layer(Mamba* mamba, unsigned long long l, float* hidden_state) {
+    Config* p = &mamba->config;
+    MambaWeights* w = &mamba->weights;
+    RunState* s = &mamba->state;
+    int dim = p->dim, d_inner = p->d_inner, d_conv = p->d_conv, d_state = p->d_state, dt_rank = p->dt_rank;
+    float* y  = s->y;   // (d_inner)
+
+    // conv_state, ssm_state = self._get_states_from_cache(inference_params)
+    float* conv_state = s->conv_state + l * d_inner * d_conv;
+    float* ssm_state  = s->ssm_state  + l * d_inner * d_state;
+
+    // xz = self.in_proj(hidden_states)  # hidden_states: (dim), in_proj (2*d_inner, dim), xz (2*d_inner)
+    matmul(s->xz, hidden_state, w->in_proj + l * 2*d_inner*dim, 2*d_inner, dim);
+    // x, z = xz.chunk(2, dim=-1)
+    float* x = s->xz;            // x (d_inner)
+    float* z = s->xz + d_inner;  // z (d_inner)
+
+
+    // Conv step
+
+    // conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))
+    // conv_state[:, -1] = x
+    shift_and_update_last_column(conv_state, x, d_inner, d_conv);
+
+    // x = torch.sum(conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1)
+    // x = x + self.conv1d.bias
+    // x = F.silu(x)
+    conv1d_silu(x, conv_state, w->conv1d_weight + l*d_inner*d_conv, w->conv1d_bias + l*d_inner, d_inner, d_conv);
+
+
+    // SSM step
+
+    // x_db = self.x_proj(x)   # x_db (dt_rank+2*d_state)
+    matmul(s->x_db, x, w->x_proj + l*(dt_rank+2*d_state)*d_inner, dt_rank+2*d_state, d_inner);
+    // dt, B, C = torch.split(x_db, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+    float *dt = s->x_db;                     // dt (dt_rank)
+    float *B = s->x_db + dt_rank;            // B  (d_state)
+    float *C = s->x_db + dt_rank + d_state;  // C  (d_state)
+
+    // dt = self.dt_proj(dt)   # dt (dt_rank), dt_proj_weight (d_inner, dt_rank), dt_proj_bias (d_inner)
+    // dt = F.softplus(dt)
+    dense_softplus(s->dt, dt, w->dt_proj_weight + l*d_inner*dt_rank, w->dt_proj_bias + l*d_inner, d_inner, dt_rank);
+    dt = s->dt;  // NOTE: dt is now bigger: (d_inner) instead of (dt_rank)
+
+    //  Discretize A and B
+    // dA = torch.exp(torch.einsum("d,dn->dn", dt, self.A))   # A (d_inner, d_state), dA (d_inner, d_state)
+    // dB = torch.einsum("d,n->dn", dt, B)    # dt (d_inner), B (d_state), dB (d_inner, d_state)
+    //  Update ssm_state
+    // ssm_state.copy_(ssm_state * dA + rearrange(x, "d -> d 1") * dB)
+    //  Compute y
+    // y = torch.einsum("dn,n->d", ssm_state, C) # ssm_state (d_inner, d_state), C (d_state), y (d_inner)
+    // y = y + self.D * x
+    // y = y * F.silu(z)  # (d_inner)
+    selective_scan(y, ssm_state, dt, w->A + l*d_inner*d_state, B, C, w->D + l*d_inner, x, z, d_inner, d_state);
+
+    // hidden_state = self.out_proj(y)  # out_proj (dim, d_inner), hidden_state (dim)
+    matmul(hidden_state, y, w->out_proj + l*dim*d_inner, dim, d_inner);
+}
+
 // flatten S D or loop for S
 // first squeeze hidden_state B dim
 // hidden_state shape: S D
 // after unsqueeze B dim
-void forward_bi_bi_layer(Mamba* mamba, unsigned long long l, float *hidden_state) {    
+void forward_bi_bi(Mamba* mamba, unsigned long long l, float *hidden_state) {    
     forward_layer(mamba, l, hidden_state);
 }
 
