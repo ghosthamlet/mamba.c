@@ -160,6 +160,23 @@ void memory_map_weights(MambaWeights *w, Config* p, float* ptr) {
     w->lm_head = p->shared_classifier ? w->token_embedding_table : ptr;
 }
 
+void memory_map_bi_bi_weights(MambaWeights *w, Config* p, float* ptr) {
+    // the multiplications below are done in 64-bit to fit the parameter counts of 13B+ models
+    unsigned long long n_layers = p->n_layers;
+    // get the pointers to the weights
+    w->in_proj = ptr;                ptr += n_layers * (2 * p->d_inner) * p->dim;
+    w->conv1d_weight = ptr;          ptr += n_layers * p->d_inner * 1 * p->d_conv;
+    w->conv1d_bias = ptr;            ptr += n_layers * p->d_inner;
+    w->x_proj = ptr;                 ptr += n_layers * (p->dt_rank + 2 * p->d_state) * p->d_inner;
+    w->dt_proj_weight = ptr;         ptr += n_layers * p->d_inner * p->dt_rank;
+    w->dt_proj_bias = ptr;           ptr += n_layers * p->d_inner;
+    w->A = ptr;                      ptr += n_layers * p->d_inner * p->d_state;
+    w->D = ptr;                      ptr += n_layers * p->d_inner;
+    w->out_proj = ptr;               ptr += n_layers * p->dim * p->d_inner;
+    w->norm = ptr;                   ptr += n_layers * p->dim;
+    w->final_norm = ptr;             ptr += p->dim;
+}
+
 void load_model_file(char* model_path, Config* config, MambaWeights* weights,
                      int* fd, float** data, ssize_t* file_size) {
     FILE *file = fopen(model_path, "rb");
@@ -205,6 +222,35 @@ void free_model(Mamba* m) {
     if (m->fd != -1) { close(m->fd); }
     // free the RunState buffers
     free_run_state(&m->state);
+}
+
+void load_bi_bi_model_file(char* model_path, Config* config, MambaWeights* weights,
+                     int* fd, float** data, ssize_t* file_size) {
+    FILE *file = fopen(model_path, "rb");
+    if (!file) { fprintf(stderr, "Couldn't open file %s\n", model_path); exit(EXIT_FAILURE); }
+    // read the magic number
+    unsigned int magic;
+    if (fread(&magic, sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
+    if (magic != 0x4d616d62) { fprintf(stderr, "Invalid magic number: %x\n", magic); exit(EXIT_FAILURE); }
+
+    if (fread(config, sizeof(Config), 1, file) != 1) { exit(EXIT_FAILURE); }
+    if (config->vocab_size % 8 != 0) {
+        config->rounded_vocab_size = config->vocab_size + (8 - (config->vocab_size % 8));
+    } else {
+        config->rounded_vocab_size = config->vocab_size;
+    }
+
+    // figure out the file size
+    fseek(file, 0, SEEK_END); // move file pointer to end of file
+    *file_size = ftell(file); // get the file size, in bytes
+    fclose(file);
+    // memory map the model weights into the data pointer
+    *fd = open(model_path, O_RDONLY); // open in read only mode
+    if (*fd == -1) { fprintf(stderr, "open failed!\n"); exit(EXIT_FAILURE); }
+    *data = mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, *fd, 0);
+    if (*data == MAP_FAILED) { fprintf(stderr, "mmap failed!\n"); exit(EXIT_FAILURE); }
+    float* weights_ptr = *data + (256 / 4);
+    memory_map_bi_bi_weights(weights, config, weights_ptr);
 }
 
 // ----------------------------------------------------------------------------
@@ -484,6 +530,14 @@ void forward_layer(Mamba* mamba, unsigned long long l, float* hidden_state) {
 
     // hidden_state = self.out_proj(y)  # out_proj (dim, d_inner), hidden_state (dim)
     matmul(hidden_state, y, w->out_proj + l*dim*d_inner, dim, d_inner);
+}
+
+// flatten S D or loop for S
+// first squeeze hidden_state B dim
+// hidden_state shape: S D
+// after unsqueeze B dim
+void forward_bi_bi_layer(Mamba* mamba, unsigned long long l, float *hidden_state) {    
+    forward_layer(mamba, l, hidden_state);
 }
 
 float* forward(Mamba* mamba, int token) {
